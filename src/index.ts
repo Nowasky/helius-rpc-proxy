@@ -1,62 +1,92 @@
-interface Env {
-	CORS_ALLOW_ORIGIN: string;
-	HELIUS_API_KEY: string;
-}
+import { Env } from './types';
+import { errorHandler } from './utils/errorHandler';
 
 export default {
 	async fetch(request: Request, env: Env) {
-
-		// If the request is an OPTIONS request, return a 200 response with permissive CORS headers
-		// This is required for the Helius RPC Proxy to work from the browser and arbitrary origins
-		// If you wish to restrict the origins that can access your Helius RPC Proxy, you can do so by
-		// changing the `*` in the `Access-Control-Allow-Origin` header to a specific origin.
-		// For example, if you wanted to allow requests from `https://example.com`, you would change the
-		// header to `https://example.com`. Multiple domains are supported by verifying that the request
-		// originated from one of the domains in the `CORS_ALLOW_ORIGIN` environment variable.
-		const supportedDomains = env.CORS_ALLOW_ORIGIN ? env.CORS_ALLOW_ORIGIN.split(',') : undefined;
-		const corsHeaders: Record<string, string> = {
-			"Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, OPTIONS",
-			"Access-Control-Allow-Headers": "*",
-		}
-		if (supportedDomains) {
-			const origin = request.headers.get('Origin')
-			if (origin && supportedDomains.includes(origin)) {
-				corsHeaders['Access-Control-Allow-Origin'] = origin
-			}
-		} else {
-			corsHeaders['Access-Control-Allow-Origin'] = '*'
-		}
-
-		if (request.method === "OPTIONS") {
-			return new Response(null, {
-				status: 200,
-				headers: corsHeaders,
+		// Authorization Key Validation
+		const authHeader = request.headers.get('Authorization');
+		if (!authHeader || authHeader !== `Bearer ${env.AUTH_KEY}`) {
+			return new Response('Unauthorized', {
+				status: 401,
 			});
 		}
 
-		const upgradeHeader = request.headers.get('Upgrade')
-
-		if (upgradeHeader || upgradeHeader === 'websocket') {
-			return await fetch(`https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`, request)
-		}
-
-
-		const { pathname, search } = new URL(request.url)
+		// Extract payload from the request
 		const payload = await request.text();
-		const proxyRequest = new Request(`https://${pathname === '/' ? 'mainnet.helius-rpc.com' : 'api.helius.xyz'}${pathname}?api-key=${env.HELIUS_API_KEY}${search ? `&${search.slice(1)}` : ''}`, {
-			method: request.method,
-			body: payload || null,
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Helius-Cloudflare-Proxy': 'true',
-			}
-		});
 
-		return await fetch(proxyRequest).then(res => {
-			return new Response(res.body, {
-				status: res.status,
-				headers: corsHeaders
+		// Validate payload if it's a POST request
+		if (request.method === 'POST') {
+			try {
+				const data = JSON.parse(payload);
+
+				if (data.length === 0) {
+					return new Response(null, {
+						status: 400,
+						statusText: JSON.stringify({
+							jsonrpc: "2.0",
+							id: null,
+							error: { code: -32600, message: "empty rpc batch" },
+						}),
+					});
+				}
+			} catch (e) {
+				return new Response(null, {
+					status: 400,
+					statusText: JSON.stringify({
+						jsonrpc: "2.0",
+						id: null,
+						error: { code: -32700, message: "failed to parse RPC request body" },
+					}),
+				});
+			}
+		}
+
+		// Parse the RPC_ENDPOINTS environment variable
+		let rpcEndpoints;
+		try {
+			rpcEndpoints = JSON.parse(env.RPC_ENDPOINTS);
+		} catch (e) {
+			console.error("Failed to parse RPC_ENDPOINTS:", e);
+			return new Response(null, {
+				status: 500,
+				statusText: "Invalid RPC_ENDPOINTS format",
 			});
+		}
+
+		// Send requests to all RPC endpoints concurrently
+		await Promise.all(
+			rpcEndpoints.map(({ url, headers = {} }) => {
+				// Merge default proxy headers with custom headers from the environment variable
+				const proxyHeaders = {
+					'Content-Type': 'application/json',
+					//'X-Helius-Cloudflare-Proxy': 'true',
+					//...corsHeaders,
+					...headers, // Custom headers specific to this endpoint
+				};
+
+				//if (origin && !headers.Origin) {
+				//	proxyHeaders['Origin'] = origin;
+				//}
+
+				if (!proxyHeaders['User-Agent']) {
+					proxyHeaders['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0';
+				}
+
+				return fetch(url, {
+					method: request.method,
+					body: payload || null,
+					headers: proxyHeaders,
+				}).catch((err) => {
+					// Handle individual request errors
+					console.error(`Failed to send request to ${url}:`, err);
+				});
+			})
+		);
+
+		// Return a simple response, indicating that the requests were forwarded
+		return new Response(null, {
+			status: 204,  // No Content
+			//headers: corsHeaders,
 		});
 	},
 };
